@@ -1,0 +1,110 @@
+name: DevSecOps NameGen Pipeline
+
+on:
+  push:
+    branches: [ "main" ]
+  
+  workflow_dispatch:
+    inputs:
+      cluster_mode:
+        description: 'Select Infrastructure Deployment Mode'
+        required: true
+        default: 'eksctl'
+        type: choice
+        options:
+          - eksctl
+          - terraform
+
+permissions:
+  id-token: write  
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+  ECR_REPOSITORY: namegen-app
+  CLUSTER_NAME: namegen-cluster
+
+jobs:
+  security-scan:
+    name: Security & Vulnerability Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy Vulnerability Scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          ignore-unfixed: true
+          severity: 'CRITICAL,HIGH'
+
+  cicd:
+    name: Build, ECR Push, and Deploy to EKS
+    needs: security-scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/Github_actions_role
+          role-session-name: github-actions-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Confirm AWS Identity
+        run: |
+          aws sts get-caller-identity
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, Tag, and Push Image to Amazon ECR
+        run: |
+          docker build -t ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }} .
+          docker tag ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }} ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+          
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+
+      - name: Update kubeconfig for EKS
+        run: |
+          aws eks update-kubeconfig --name ${{ env.CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
+      
+      - name: Create K8s Database Secret
+        env:
+          DB_USERNAME: ${{ secrets.DB_USERNAME }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          MONGODB_URL: ${{ secrets.MONGODB_URL }}
+        run: |
+          kubectl create secret generic namegen-db-secret \
+            --from-literal=DB_USERNAME="$DB_USERNAME" \
+            --from-literal=DB_PASSWORD="$DB_PASSWORD" \
+            --from-literal=MONGODB_URL="$MONGODB_URL" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Deploy & Verify Kubernetes Workloads
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+          DEPLOY_MODE: ${{ github.event.inputs.cluster_mode || 'eksctl' }}
+        run: |
+          echo "-> Deploying using Kustomize overlay for: $DEPLOY_MODE"
+
+          # Prevent conflicts when switching overlays
+          kubectl delete storageclass gp3 --ignore-not-found
+          kubectl apply -k k8s/overlays/$DEPLOY_MODE 
+
+          kubectl set image deployment/namegen-app namegen-app=$ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG
+
+          
+          kubectl rollout status deployment/namegen-app --timeout=180s
+          kubectl rollout status statefulset/mongodb --timeout=300s
+
+          # Display service and public load balancer 
+          kubectl get service namegen-service

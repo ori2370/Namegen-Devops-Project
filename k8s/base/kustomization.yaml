@@ -1,0 +1,13 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - storageclass.yaml
+  - mongodb-sts.yaml
+  - app-deployment.yaml
+  - app-service.yaml
+
+configMapGenerator:
+  - name: mongodb-init
+    files:
+      - mongo-init.sh
