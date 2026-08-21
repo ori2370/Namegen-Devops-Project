@@ -48,6 +48,8 @@ Kubernetes resources are managed using *Kustomize overlays*, allowing the same b
 ---
 # Infrastructure Deployment Modes
 when deploying, you can choose the infrastructure you used in the github actions tab, under run workflow- and choosing the right infrastructure.
+if you choose Terraform and you are not on a free tier, you are highly encoureged to change
+the instance to ```t3.medium``` instead, since we are using prometheus and grafana we need more ram thus t3.small will not suffice.
 please note that we already assume you have IAM policy for using github actions if not you can use the follwing:
 ```
  {
